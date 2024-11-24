@@ -1,4 +1,4 @@
-# vlx-first-project
+# shoxr11x's bot for project
 Task Manager Bot
 This is a Telegram bot designed to manage tasks between a Rector and Staff members. The bot allows the Rector to create, edit, and assign tasks to Staff, while Staff can view and update the status of their assigned tasks.
 
