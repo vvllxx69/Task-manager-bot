@@ -1,4 +1,3 @@
-# bot.py
 import json
 import logging
 import os
@@ -33,7 +32,11 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship, declarative_base, sessionmaker
 from sqlalchemy import create_engine
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(
@@ -66,6 +69,7 @@ class User(Base):
     phone_number = Column(String, unique=True, nullable=False)
     role = Column(String, nullable=False)  # 'rector' or 'staff'
     assignments = relationship('TaskAssignment', back_populates='user')
+    comments = relationship('Comment', back_populates='user')
 
 class Task(Base):
     __tablename__ = 'tasks'
@@ -73,6 +77,7 @@ class Task(Base):
     title = Column(String, nullable=False)
     description = Column(Text, nullable=False)
     deadline = Column(DateTime, nullable=False)
+    notification_interval = Column(Integer, default=1)  # Interval in minutes before deadline
     assignments = relationship('TaskAssignment', back_populates='task', cascade='all, delete-orphan')
     comments = relationship('Comment', back_populates='task', cascade='all, delete-orphan')
 
@@ -84,14 +89,13 @@ class Comment(Base):
     comment_text = Column(Text, nullable=False)
     timestamp = Column(DateTime, nullable=False)
     task = relationship('Task', back_populates='comments')
-    user = relationship('User')
+    user = relationship('User', back_populates='comments')
 
 # Database connection
 DATABASE_URL = "sqlite:///task_manager.db"  # For production, use PostgreSQL or similar
 engine = create_engine(DATABASE_URL, echo=False)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 Base.metadata.create_all(bind=engine)
-
 
 # Initialize Scheduler
 scheduler = AsyncIOScheduler()
@@ -117,8 +121,8 @@ def create_user(session, user_id, username, name, surname, phone_number, role):
     logger.info(f"Created new user: {name} {surname}, ID: {user_id}, Role: {role}")
     return user
 
-def create_task(session, title, description, deadline, assignee_ids):
-    task = Task(title=title, description=description, deadline=deadline)
+def create_task(session, title, description, deadline, notification_interval, assignee_ids):
+    task = Task(title=title, description=description, deadline=deadline, notification_interval=notification_interval)
     session.add(task)
     session.commit()  # Commit to get the task.id
 
@@ -128,7 +132,7 @@ def create_task(session, title, description, deadline, assignee_ids):
             assignment = TaskAssignment(task_id=task.id, user_id=user.id)
             session.add(assignment)
     session.commit()
-    logger.info(f"Created new task: {title}, Assigned to: {assignee_ids}")
+    logger.info(f"Created new task: {title}, Assigned to: {assignee_ids}, Notification Interval: {notification_interval} minutes")
     return task
 
 def add_comment(session, task_id, user_id, comment_text):
@@ -138,9 +142,16 @@ def add_comment(session, task_id, user_id, comment_text):
     logger.info(f"Added comment to task {task_id} by user {user_id}")
     return comment
 
-def schedule_reminder(app, task_id, reminder_time):
-    scheduler.add_job(send_reminder, DateTrigger(run_date=reminder_time), args=[app, task_id])
-    logger.info(f"Scheduled reminder for task {task_id} at {reminder_time}")
+def schedule_reminder(app, task_id, notification_interval):
+    """
+    Schedule reminders every `notification_interval` minutes or hours until the task is completed.
+    """
+    trigger = IntervalTrigger(
+        minutes=notification_interval,  # Change to 'hours=notification_interval' if needed
+        start_date=datetime.now() + timedelta(seconds=10),  # Start after 10 seconds
+    )
+    scheduler.add_job(send_reminder, trigger, args=[app, task_id], id=f"reminder_task_{task_id}", replace_existing=True)
+    logger.info(f"Scheduled reminders for task {task_id} every {notification_interval} minutes until completion")
 
 async def send_reminder(app, task_id):
     session = SessionLocal()
@@ -150,14 +161,24 @@ async def send_reminder(app, task_id):
         session.close()
         return
 
+    # Check if the task is already completed
+    all_completed = all(assignment.status == "Completed" for assignment in task.assignments)
+    if all_completed:
+        # Remove the scheduled job since the task is completed
+        scheduler.remove_job(f"reminder_task_{task_id}")
+        logger.info(f"All assignments for task {task_id} are completed. Removed reminder job.")
+        session.close()
+        return
+
     for assignment in task.assignments:
         assignee = assignment.user
-        message_text = CONFIG['reminder_message'].format(title=task.title, deadline=task.deadline.strftime('%Y-%m-%d %H:%M'))
-        try:
-            await app.bot.send_message(chat_id=assignee.id, text=message_text, parse_mode=ParseMode.MARKDOWN)
-            logger.info(f"Sent reminder to user {assignee.id} for task {task_id}.")
-        except Exception as e:
-            logger.error(f"Error sending reminder to user {assignee.id}: {e}")
+        if assignment.status != "Completed":
+            message_text = CONFIG['reminder_message'].format(title=task.title, deadline=task.deadline.strftime('%Y-%m-%d %H:%M'))
+            try:
+                await app.bot.send_message(chat_id=assignee.id, text=message_text, parse_mode=ParseMode.MARKDOWN)
+                logger.info(f"Sent reminder to user {assignee.id} for task {task_id}.")
+            except Exception as e:
+                logger.error(f"Error sending reminder to user {assignee.id}: {e}")
 
     session.close()
 
@@ -169,34 +190,42 @@ async def notify_completion_if_all_completed(app, task_id):
         session.close()
         return
 
-    # Check if all assignees have completed the task
+    # Check if all assignments are completed
     assignments = session.query(TaskAssignment).filter_by(task_id=task_id).all()
-    if all(assignment.status == 'Completed' for assignment in assignments):
-        task_creator = session.query(User).filter(User.role == 'rector').first()  # Assuming the rector creates tasks
-        if not task_creator:
-            logger.warning("No task creator (rector) found for task deletion confirmation.")
+    if not assignments:
+        logger.warning(f"No assignments found for task {task_id}.")
+        session.close()
+        return
+
+    if all(assignment.status == "Completed" for assignment in assignments):
+        # Remove the scheduled reminder job since the task is completed
+        try:
+            scheduler.remove_job(f"reminder_task_{task_id}")
+            logger.info(f"Removed reminder job for completed task {task_id}.")
+        except Exception as e:
+            logger.warning(f"No scheduled reminder job found for task {task_id}: {e}")
+
+        # Notify rector (or other relevant role)
+        rectors = session.query(User).filter(User.role == "rector").all()
+        if not rectors:
+            logger.warning("No rectors found to notify about task completion.")
             session.close()
             return
 
-        # Ask the task creator if they want to delete the task
-        keyboard = [
-            [InlineKeyboardButton("✅ Yes, Delete", callback_data=f"delete_task_{task.id}_confirm")],
-            [InlineKeyboardButton("❌ No, Keep It", callback_data=f"keep_task_{task.id}_confirm")],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        try:
-            await app.bot.send_message(
-                chat_id=task_creator.id,
-                text=f"The task *{task.title}* has been completed by all assignees. Do you want to delete it?",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=reply_markup
-            )
-            logger.info(f"Notified creator {task_creator.id} about deleting task {task_id}.")
-        except Exception as e:
-            logger.error(f"Error notifying creator {task_creator.id}: {e}")
+        for rector in rectors:
+            try:
+                message_text = f"The task *{task.title}* has been completed by all assignees."
+                await app.bot.send_message(
+                    chat_id=rector.id, text=message_text, parse_mode="Markdown"
+                )
+                logger.info(f"Notified rector {rector.id} about task {task_id} completion.")
+            except Exception as e:
+                logger.error(f"Failed to notify rector {rector.id}: {e}")
+    else:
+        logger.info(f"Task {task_id} is not yet completed by all assignees.")
 
     session.close()
+
 
 # Conversation States
 (
@@ -207,6 +236,7 @@ async def notify_completion_if_all_completed(app, task_id):
     RECTOR_TASK_TITLE,
     RECTOR_TASK_DESCRIPTION,
     RECTOR_TASK_DEADLINE,
+    RECTOR_TASK_NOTIFICATION_INTERVAL,
     ASSIGNMENT_METHOD,
     RECTOR_TASK_ASSIGNEE,
     COMMENT_TASK,
@@ -214,7 +244,7 @@ async def notify_completion_if_all_completed(app, task_id):
     EDIT_TASK_FIELD,
     EDIT_TASK_VALUE,
     CONFIRM_DELETE_TASK,
-) = range(14)
+) = range(15)  
 
 # Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -422,7 +452,8 @@ async def export_users_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     success = export_user_data_to_txt(session, file_path)
     if success:
         # Send the file to the user
-        await update.message.reply_document(document=open(file_path, 'rb'))
+        with open(file_path, 'rb') as doc:
+            await update.message.reply_document(document=doc)
         logger.info(f"User {user_id} exported user data.")
     else:
         await update.message.reply_text("Failed to export user data.")
@@ -431,6 +462,7 @@ async def export_users_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 async def show_rector_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [KeyboardButton("📋 Task List"), KeyboardButton("🆕 New Task")],
+        # [KeyboardButton("📂 Export Users")],  # Removed Export Users button
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     if update.callback_query:
@@ -489,14 +521,14 @@ async def rector_task_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
         session.close()
         return
 
-    # Modified to show assignees with their statuses
+    # Gather assignees' info
     assignees_info = ""
     for assignment in task.assignments:
         assignee = assignment.user
         status = assignment.status
         assignees_info += f"{assignee.name} {assignee.surname} - {status}\n"
 
-    # Modified to include comments
+    # Gather comments
     comments_text = ""
     if task.comments:
         comments_text = "\n*Comments:*\n"
@@ -504,11 +536,16 @@ async def rector_task_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
             commenter = comment.user
             comments_text += f"- {commenter.name} {commenter.surname} [{comment.timestamp.strftime('%Y-%m-%d %H:%M')}]: {comment.comment_text}\n"
 
+    # Display notification interval
+    notification_interval = task.notification_interval
+    notification_text = f"*Notification Interval:* {notification_interval} minutes\n"
+
     task_text = (
         f"*ID:* {task.id}\n"
         f"*Title:* {task.title}\n"
         f"*Description:* {task.description}\n"
         f"*Assignees:*\n{assignees_info}"
+        f"{notification_text}"
         f"*Deadline:* {task.deadline.strftime('%Y-%m-%d %H:%M')}\n"
         f"{comments_text}"
     )
@@ -565,15 +602,60 @@ async def handle_rector_task_deadline(update: Update, context: ContextTypes.DEFA
         return RECTOR_TASK_DEADLINE
 
     context.user_data['task_deadline'] = deadline
-    # Prompt for assignment method
+    await update.message.reply_text("⏰ Please enter the *Notification Interval* in minutes (e.g., 1):", parse_mode=ParseMode.MARKDOWN)
+    logger.info(f"Rector {update.effective_user.id} entered task deadline: {deadline_str}")
+    return RECTOR_TASK_NOTIFICATION_INTERVAL
+
+async def handle_rector_task_notification_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    interval_str = update.message.text.strip()
+    user_id = update.effective_user.id
+
+    if not interval_str.isdigit():
+        await update.message.reply_text(CONFIG.get('invalid_notification_interval', "❌ Please enter a valid number of minutes (e.g., 1)."))
+        logger.warning(f"Rector {user_id} entered invalid notification interval: {interval_str}")
+        return RECTOR_TASK_NOTIFICATION_INTERVAL
+
+    interval = int(interval_str)
+    if interval <= 0:
+        await update.message.reply_text(CONFIG.get('invalid_notification_interval', "❌ Notification interval must be a positive number of minutes."))
+        logger.warning(f"Rector {user_id} entered non-positive notification interval: {interval}")
+        return RECTOR_TASK_NOTIFICATION_INTERVAL
+
+    context.user_data['task_notification_interval'] = interval
+    logger.info(f"Rector {user_id} set notification interval: {interval} minutes")
+
+    await update.message.reply_text(CONFIG.get('notification_interval_set', "✅ Notification interval set successfully."))
+
+    # Proceed to assignment method
     keyboard = [
         [InlineKeyboardButton("📌 Assign to Someone", callback_data="assign_specific")],
         [InlineKeyboardButton("🌐 Assign to All Staff", callback_data="assign_all")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(CONFIG.get('choose_assignment_method', "Please choose assignment method:"), reply_markup=reply_markup)
-    logger.info(f"Rector {update.effective_user.id} is choosing task assignment method.")
     return ASSIGNMENT_METHOD
+
+async def assign_staff_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    staff_id = int(query.data.split("_")[2])
+    selected_staff_ids = context.user_data.get('selected_staff_ids', [])
+
+    if staff_id not in selected_staff_ids:
+        selected_staff_ids.append(staff_id)
+    else:
+        selected_staff_ids.remove(staff_id)
+
+    context.user_data['selected_staff_ids'] = selected_staff_ids
+
+    # Update the message with the current selection
+    session = SessionLocal()
+    staff = session.query(User).filter(User.id == staff_id).first()
+    session.close()
+
+    message_text = f"{staff.username or staff.name} {staff.surname} {'selected' if staff_id in selected_staff_ids else 'deselected'}"
+    await query.answer(message_text)
 
 async def set_assignment_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -581,38 +663,49 @@ async def set_assignment_method(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
 
     if choice == "assign_specific":
-        await query.edit_message_text("👤 Please enter the *Assignee's* Telegram username (e.g., @username), ID, or full name:", parse_mode=ParseMode.MARKDOWN)
-        logger.info(f"Rector {update.effective_user.id} chose to assign to a specific user.")
+        session = SessionLocal()
+        staff_members = session.query(User).filter(User.role == 'staff').all()
+        session.close()
+
+        if not staff_members:
+            await query.edit_message_text("❌ No staff members found to assign the task.")
+            logger.error(f"No staff members found for task assignment by Rector {update.effective_user.id}.")
+            return ConversationHandler.END
+
+        # Create inline buttons for all staff usernames
+        buttons = [
+            [InlineKeyboardButton(f"{staff.username or staff.name} {staff.surname}", callback_data=f"assign_staff_{staff.id}")]
+            for staff in staff_members
+        ]
+        buttons.append([InlineKeyboardButton("✅ Confirm Selection", callback_data="assign_confirm")])
+        reply_markup = InlineKeyboardMarkup(buttons)
+
+        await query.edit_message_text("👤 Select staff members to assign the task:", reply_markup=reply_markup)
+        context.user_data['selected_staff_ids'] = []  # Initialize selected IDs
         return RECTOR_TASK_ASSIGNEE
+
     elif choice == "assign_all":
         # Assign to all staff members
         session = SessionLocal()
         staff_members = session.query(User).filter(User.role == 'staff').all()
+        session.close()
+
         if not staff_members:
             await query.edit_message_text("❌ No staff members found to assign the task.")
-            logger.error(f"No staff members found for task assignment by Rector {update.effective_user.id}.")
-            session.close()
             return ConversationHandler.END
 
         assignee_ids = [staff.id for staff in staff_members]
-
-        # Create the task and assign to all staff
         title = context.user_data.get('task_title')
         description = context.user_data.get('task_description')
         deadline = context.user_data.get('task_deadline')
-        task = create_task(session, title, description, deadline, assignee_ids)
+        notification_interval = context.user_data.get('task_notification_interval', 1)  # Default to 1 minute
 
-        # Schedule reminders
-        reminder_time = deadline - timedelta(hours=24)
-        if reminder_time > datetime.now():
-            schedule_reminder(context.application, task.id, reminder_time)
+        task = create_task(session, title, description, deadline, notification_interval, assignee_ids)
 
-        await query.edit_message_text(CONFIG['task_created'].format(title=title, assignee="All Staff Members"), parse_mode=ParseMode.MARKDOWN)
-        logger.info(f"Rector {update.effective_user.id} created task '{title}' assigned to all staff members.")
-        session.close()
+        # Schedule reminders based on notification_interval
+        schedule_reminder(context.application, task.id, notification_interval)
 
-        # Show Rector Menu
-        await show_rector_menu(update, context)
+        await query.edit_message_text(CONFIG['task_created'].format(title=title, assignee="All Staff Members"))
         return ConversationHandler.END
 
 async def handle_rector_task_assignee(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -650,26 +743,51 @@ async def handle_rector_task_assignee(update: Update, context: ContextTypes.DEFA
         session.close()
         return RECTOR_TASK_ASSIGNEE
 
+    # Retrieve notification_interval
+    notification_interval = context.user_data.get('task_notification_interval', 1)  # Default to 1 minute
+
     # Create the task and assign to the specific user
     title = context.user_data.get('task_title')
     description = context.user_data.get('task_description')
     deadline = context.user_data.get('task_deadline')
-    task = create_task(session, title, description, deadline, [assignee.id])
+    task = create_task(session, title, description, deadline, notification_interval, [assignee.id])
 
-    # Schedule reminder
-    reminder_time = deadline - timedelta(hours=24)
-    if reminder_time > datetime.now():
-        schedule_reminder(context.application, task.id, reminder_time)
+    # Schedule reminders based on notification_interval
+    schedule_reminder(context.application, task.id, notification_interval)
 
     await update.message.reply_text(
         CONFIG['task_created'].format(title=title, assignee=f"{assignee.name} {assignee.surname}"),
         parse_mode=ParseMode.MARKDOWN
     )
-    logger.info(f"Rector {update.effective_user.id} created task '{title}' assigned to {assignee.id}")
+    logger.info(f"Rector {update.effective_user.id} created task '{title}' assigned to {assignee.id} with notification interval {notification_interval} minutes")
     session.close()
 
     # Show Rector Menu
     await show_rector_menu(update, context)
+    return ConversationHandler.END
+
+async def assign_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    selected_staff_ids = context.user_data.get('selected_staff_ids', [])
+    if not selected_staff_ids:
+        await query.edit_message_text("❌ No staff members selected.")
+        return ConversationHandler.END
+
+    session = SessionLocal()
+    title = context.user_data.get('task_title')
+    description = context.user_data.get('task_description')
+    deadline = context.user_data.get('task_deadline')
+    notification_interval = context.user_data.get('task_notification_interval', 1)  # Default to 1 minute
+
+    task = create_task(session, title, description, deadline, notification_interval, selected_staff_ids)
+    session.close()
+
+    # Schedule reminders based on notification_interval
+    schedule_reminder(context.application, task.id, notification_interval)
+
+    await query.edit_message_text(CONFIG['task_created'].format(title=title, assignee="Selected Staff Members"))
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -692,7 +810,7 @@ async def edit_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📝 Title", callback_data="edit_field_title")],
         [InlineKeyboardButton("📄 Description", callback_data="edit_field_description")],
         [InlineKeyboardButton("⏰ Deadline", callback_data="edit_field_deadline")],
-        [InlineKeyboardButton("👥 Assignees", callback_data="edit_field_assignees")],
+        [InlineKeyboardButton("🔔 Notification Interval", callback_data="edit_field_notification_interval")],  # New option
         [InlineKeyboardButton("🔙 Back", callback_data=f"rector_task_{task_id}")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -704,7 +822,12 @@ async def edit_task_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     field = query.data.split("_")[2]
     context.user_data['edit_task_field'] = field
-    await query.edit_message_text(f"Please enter the new value for *{field.capitalize()}*:", parse_mode=ParseMode.MARKDOWN)
+
+    if field == 'notification_interval':
+        await query.edit_message_text("Please enter the new *Notification Interval* in minutes (e.g., 1):", parse_mode=ParseMode.MARKDOWN)
+    else:
+        await query.edit_message_text(f"Please enter the new value for *{field.capitalize()}*:", parse_mode=ParseMode.MARKDOWN)
+
     return EDIT_TASK_VALUE
 
 async def edit_task_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -728,47 +851,43 @@ async def edit_task_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             task.deadline = datetime.strptime(new_value, "%Y-%m-%d %H:%M")
         except ValueError:
             await update.message.reply_text(CONFIG.get('invalid_deadline', "Invalid deadline format."), parse_mode=ParseMode.MARKDOWN)
+            logger.warning(f"Rector {update.effective_user.id} entered invalid deadline format: {new_value}")
             session.close()
             return EDIT_TASK_VALUE
-    elif field == 'assignees':
-        # For simplicity, let's assume we can only assign to one user here
-        assignee_input = new_value
-        assignee = None
-        if assignee_input.startswith('@'):
-            username = assignee_input[1:]
-            assignee = session.query(User).filter(
-                User.username.ilike(username), User.role == 'staff'
-            ).first()
-        else:
-            try:
-                assignee_id = int(assignee_input)
-                assignee = session.query(User).filter(User.id == assignee_id, User.role == 'staff').first()
-            except ValueError:
-                # Try to search by name and surname
-                name_parts = assignee_input.split()
-                if len(name_parts) == 2:
-                    first_name, last_name = name_parts
-                    assignee = session.query(User).filter(
-                        User.name.ilike(first_name), User.surname.ilike(last_name), User.role == 'staff'
-                    ).first()
-                else:
-                    assignee = None
-        if not assignee:
-            await update.message.reply_text("❌ Assignee not found or not a staff member. Please enter a valid *Assignee's* Telegram username (e.g., @username), ID, or full name:", parse_mode=ParseMode.MARKDOWN)
+    elif field == 'notification_interval':
+        if not new_value.isdigit():
+            await update.message.reply_text("❌ Please enter a valid number of minutes (e.g., 1).")
+            logger.warning(f"Rector {update.effective_user.id} entered invalid notification interval: {new_value}")
             session.close()
             return EDIT_TASK_VALUE
-        # Remove existing assignments and assign to the new user
-        task.assignments = []
-        assignment = TaskAssignment(task_id=task.id, user_id=assignee.id)
-        session.add(assignment)
+
+        interval = int(new_value)
+        if interval <= 0:
+            await update.message.reply_text("❌ Notification interval must be a positive number of minutes.")
+            logger.warning(f"Rector {update.effective_user.id} entered non-positive notification interval: {interval}")
+            session.close()
+            return EDIT_TASK_VALUE
+
+        task.notification_interval = interval
+        logger.info(f"Task {task_id} notification interval updated to {interval} minutes")
+
+        # Reschedule the reminder
+        try:
+            scheduler.remove_job(f"reminder_task_{task.id}")  # Remove existing job
+            logger.info(f"Removed existing reminder job for task {task.id} during edit.")
+        except Exception as e:
+            logger.warning(f"No existing reminder job found for task {task.id}: {e}")
+
+        schedule_reminder(context.application, task.id, interval)
+
     else:
-        await update.message.reply_text("Invalid field.")
+        await update.message.reply_text("❌ Invalid field.")
         session.close()
         return ConversationHandler.END
 
     session.commit()
     await update.message.reply_text(f"✅ Task *{field.capitalize()}* updated successfully.", parse_mode=ParseMode.MARKDOWN)
-    logger.info(f"Task {task_id} updated by Rector {update.effective_user.id}.")
+    logger.info(f"Task {task_id} updated by Rector {update.effective_user.id}. Field: {field}, New Value: {new_value}")
     session.close()
 
     # Show Rector Menu
@@ -802,6 +921,13 @@ async def confirm_delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE
         session.close()
         return ConversationHandler.END
 
+    # Remove the scheduled reminder job if exists
+    try:
+        scheduler.remove_job(f"reminder_task_{task.id}")
+        logger.info(f"Removed reminder job for deleted task {task.id}.")
+    except Exception as e:
+        logger.warning(f"No scheduled reminder job found for task {task.id}: {e}")
+
     session.delete(task)
     session.commit()
     await query.edit_message_text("🗑️ Task deleted successfully.")
@@ -823,6 +949,13 @@ async def confirm_delete_after_completion(update: Update, context: ContextTypes.
         await query.edit_message_text("❌ Task not found.")
         session.close()
         return
+
+    # Remove the scheduled reminder job if exists
+    try:
+        scheduler.remove_job(f"reminder_task_{task.id}")
+        logger.info(f"Removed reminder job for deleted task {task.id}.")
+    except Exception as e:
+        logger.warning(f"No scheduled reminder job found for task {task.id}: {e}")
 
     # Delete the task
     session.delete(task)
@@ -862,12 +995,13 @@ async def send_reminder_to_assignees(update: Update, context: ContextTypes.DEFAU
 
     for assignment in task.assignments:
         assignee = assignment.user
-        message_text = CONFIG['reminder_message'].format(title=task.title, deadline=task.deadline.strftime('%Y-%m-%d %H:%M'))
-        try:
-            await context.application.bot.send_message(chat_id=assignee.id, text=message_text, parse_mode=ParseMode.MARKDOWN)
-            logger.info(f"Sent reminder to user {assignee.id} for task {task_id}.")
-        except Exception as e:
-            logger.error(f"Error sending reminder to user {assignee.id}: {e}")
+        if assignment.status != "Completed":
+            message_text = CONFIG['reminder_message'].format(title=task.title, deadline=task.deadline.strftime('%Y-%m-%d %H:%M'))
+            try:
+                await context.application.bot.send_message(chat_id=assignee.id, text=message_text, parse_mode=ParseMode.MARKDOWN)
+                logger.info(f"Sent reminder to user {assignee.id} for task {task_id}.")
+            except Exception as e:
+                logger.error(f"Error sending reminder to user {assignee.id}: {e}")
 
     await query.edit_message_text("🔔 Reminder sent to assignees.")
     session.close()
@@ -1010,22 +1144,22 @@ async def complete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     assignment = session.query(TaskAssignment).filter_by(task_id=task_id, user_id=user_id).first()
     if not assignment:
-        await query.edit_message_text("⚠️ You are not assigned to this task.", parse_mode=ParseMode.MARKDOWN)
+        await query.edit_message_text("⚠️ You are not assigned to this task.", parse_mode="Markdown")
         logger.warning(f"User {user_id} is not assigned to task {task_id}.")
         session.close()
         return
 
-    if assignment.status != 'Completed':
-        assignment.status = 'Completed'
+    if assignment.status != "Completed":
+        assignment.status = "Completed"
         session.commit()
-        await query.edit_message_text(CONFIG['task_completed'].format(title=assignment.task.title), parse_mode=ParseMode.MARKDOWN)
+        await query.edit_message_text(f"✅ You have completed the task *{assignment.task.title}*.", parse_mode="Markdown")
         logger.info(f"Task {task_id} completed by user {user_id}.")
 
-        # Notify Rector if all assignments are completed
+        # Notify if all assignees have completed
         await notify_completion_if_all_completed(context.application, task_id)
     else:
-        await query.edit_message_text(CONFIG['task_already_completed'].format(title=assignment.task.title), parse_mode=ParseMode.MARKDOWN)
-        logger.info(f"Task {task_id} already completed by user {user_id}.")
+        await query.edit_message_text(f"⚠️ Task *{assignment.task.title}* is already marked as completed.", parse_mode="Markdown")
+        logger.info(f"Task {task_id} already marked as completed by user {user_id}.")
     session.close()
 
 async def comment_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1091,7 +1225,12 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Main Function
 def main():
     # Initialize the bot application
-    app = ApplicationBuilder().token("token postav' svoy").build()  # Replace with your bot token
+    BOT_TOKEN = os.getenv("BOT_TOKEN")
+    if not BOT_TOKEN:
+        logger.error("Bot token not found. Please set the BOT_TOKEN environment variable.")
+        return
+
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # Register /start command handler
     app.add_handler(CommandHandler("start", start))
@@ -1116,8 +1255,12 @@ def main():
             RECTOR_TASK_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_rector_task_title)],
             RECTOR_TASK_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_rector_task_description)],
             RECTOR_TASK_DEADLINE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_rector_task_deadline)],
+            RECTOR_TASK_NOTIFICATION_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_rector_task_notification_interval)],  # New handler
             ASSIGNMENT_METHOD: [CallbackQueryHandler(set_assignment_method, pattern="^(assign_specific|assign_all)$")],
-            RECTOR_TASK_ASSIGNEE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_rector_task_assignee)],
+            RECTOR_TASK_ASSIGNEE: [
+                CallbackQueryHandler(assign_staff_selection, pattern="^assign_staff_\\d+$"),
+                CallbackQueryHandler(assign_confirm, pattern="^assign_confirm$")
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
@@ -1157,7 +1300,7 @@ def main():
     # Rector Task List Handler
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📋 Task List$"), rector_task_list))
     app.add_handler(CallbackQueryHandler(rector_task_action, pattern="^rector_task_\\d+$"))
-    app.add_handler(CallbackQueryHandler(rector_task_list, pattern="^back_to_task_list$"))
+    app.add_handler(CallbackQueryHandler(lambda update, context: rector_task_list(update, context), pattern="^back_to_task_list$"))
 
     # Rector Send Reminder Handler
     app.add_handler(CallbackQueryHandler(send_reminder_to_assignees, pattern="^remind_task_\\d+$"))
@@ -1165,7 +1308,7 @@ def main():
     # Staff All Tasks Handler
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📋 All Tasks$"), staff_all_tasks))
     app.add_handler(CallbackQueryHandler(staff_task_action, pattern="^staff_task_\\d+$"))
-    app.add_handler(CallbackQueryHandler(staff_all_tasks, pattern="^back_to_staff_task_list$"))
+    app.add_handler(CallbackQueryHandler(lambda update, context: staff_all_tasks(update, context), pattern="^back_to_staff_task_list$"))
 
     # Staff My Tasks Handler
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📝 My Tasks$"), staff_my_tasks))
@@ -1199,3 +1342,13 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+    ##
+
+
+
+
+
