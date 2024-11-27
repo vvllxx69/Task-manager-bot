@@ -19,3 +19,11 @@ venv\Scripts \activate
 
 
 
+
+
+to use notification interval 
+pip install alembic
+alembic init alembic
+alembic revision --autogenerate -m
+alembic upgrade head
+
