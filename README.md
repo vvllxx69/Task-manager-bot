@@ -2,7 +2,7 @@
 
 ### Developers
 - [Shoxrux Abdumovlonov](https://github.com/vvllxx69)
-- Komron Asadullaxojaev
+- Komron Asadullaxojaev(https://github.com/en1gma0)
 
 ---
 
@@ -11,6 +11,12 @@
 The Task Manager Bot is a Telegram bot designed to streamline task assignment and management between a Rector and Staff members. The bot provides an intuitive and interactive interface to help users assign, track, and update tasks efficiently. It's a perfect solution for managing organizational tasks with ease and transparency.
 
 ---
+
+to use notification interval 
+pip install alembic
+alembic init alembic
+alembic revision --autogenerate -m
+alembic upgrade head
 
 ## Features
 
