@@ -2,7 +2,7 @@
 
 ### Developers
 - [Shoxrux Abdumovlonov](https://github.com/vvllxx69)
-- Komron Asadullaxojaev(https://github.com/en1gma0)
+- [Komron Asadullaxojaev](https://github.com/en1gma0)
 
 ---
 
