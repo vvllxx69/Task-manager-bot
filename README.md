@@ -27,6 +27,7 @@ alembic upgrade head
 - **Delete Tasks**: Remove tasks that are no longer relevant.
 - **Reminders**: Send task reminders to assigned staff.
 - **Status Tracking**: Monitor the progress of tasks, including Accepted, Completed, or Pending statuses.
+- **Notification intrerval**: send notification to staff every choosed time.
 
 ### Staff
 - **Task List**: View all assigned tasks.
